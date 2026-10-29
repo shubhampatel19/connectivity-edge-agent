@@ -15,12 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/spr732/connectivity-contracts/wire"
-)
-
-const (
-	thermalWarnC  = 80.0
-	thermalFaultC = 90.0
+	"github.com/shubhampatel19/connectivity-contracts/wire"
 )
 
 type DeviceConfig struct {
@@ -28,10 +23,11 @@ type DeviceConfig struct {
 	HeartbeatEvery  int // heartbeat every N send ticks
 	MaxBatch        int
 	MaxDrainBatches int // batches a device may send per tick while catching up
+	AlertQueue      int // alerts a device holds while it can't reach the cloud
 }
 
 // BundleConfig controls log bundle collection. A zero Interval disables
-// scheduled bundles; alert bundles still fire on thermal faults.
+// scheduled bundles; alert bundles are still collected for faults.
 type BundleConfig struct {
 	Interval      time.Duration
 	AlertCooldown time.Duration
@@ -48,6 +44,7 @@ type Device struct {
 	uploader  *Uploader // nil disables log bundles
 	sensors   *Sensors
 	buf       *Buffer
+	alerts    *alertQueue
 	logs      *LogRing
 	m         *metrics
 	log       *slog.Logger
@@ -61,7 +58,8 @@ type Device struct {
 
 	nextBundle      time.Time
 	lastAlertBundle time.Time
-	inFault         bool
+	thermalFault    bool
+	psuFault        bool
 	lastReallocated float64
 }
 
@@ -105,23 +103,26 @@ func (d *Device) Run(ctx context.Context) {
 			if dropped := d.buf.Push(samples...); dropped > 0 {
 				d.m.samplesDropped.Add(float64(dropped))
 			}
-			faultStarted := d.observe(now, tick, samples)
+			d.raiseAlerts(now, d.observe(now, tick, samples))
+			d.sendAlerts(ctx)
 			d.flush(ctx)
 			if tick%d.cfg.HeartbeatEvery == 0 {
 				d.heartbeat(ctx)
 			}
-			d.maybeCollect(now, faultStarted)
+			d.maybeCollect(now)
 		}
 	}
 }
 
 // observe writes what a real device's system log would say about these
-// readings. It reports whether a thermal fault just started.
-func (d *Device) observe(now time.Time, tick int, samples []wire.Sample) (faultStarted bool) {
+// readings, and returns the faults that started on this reading.
+func (d *Device) observe(now time.Time, tick int, samples []wire.Sample) []alertSignal {
 	v := make(map[string]float64, len(samples))
 	for _, s := range samples {
 		v[s.Metric] = s.Value
 	}
+	var started []alertSignal
+
 	temp, fan := v["cpu_temp_c"], v["fan_rpm"]
 	switch {
 	case temp >= thermalFaultC:
@@ -129,39 +130,61 @@ func (d *Device) observe(now time.Time, tick int, samples []wire.Sample) (faultS
 	case temp >= thermalWarnC:
 		d.logs.Add(now, "WARN", "thermal", fmt.Sprintf("cpu_temp=%.1fC over %.0fC, fan=%.0frpm", temp, thermalWarnC, fan))
 	}
+	switch {
+	case !d.thermalFault && temp >= thermalFaultC:
+		d.thermalFault = true
+		started = append(started, alertSignal{
+			code: wire.AlertThermalCritical, severity: wire.SeverityCritical, value: temp, wantsBundle: true,
+			message: fmt.Sprintf("cpu_temp=%.1fC over fault threshold %.0fC, fan=%.0frpm", temp, thermalFaultC, fan),
+		})
+	case d.thermalFault && temp < thermalClearC:
+		d.thermalFault = false
+		d.logs.Add(now, "INFO", "thermal", fmt.Sprintf("cpu_temp=%.1fC back under %.0fC, thermal fault cleared", temp, thermalClearC))
+	}
+
 	if r := v["disk_reallocated_sectors"]; r > d.lastReallocated {
 		d.logs.Add(now, "WARN", "storage", fmt.Sprintf("disk0 reallocated sector count rose to %.0f", r))
+		started = append(started, alertSignal{
+			code: wire.AlertDiskReallocated, severity: wire.SeverityWarning, value: r,
+			message: fmt.Sprintf("disk0 reallocated sector count rose to %.0f", r),
+		})
 		d.lastReallocated = r
 	}
-	if psu := v["psu_voltage_v"]; math.Abs(psu-12) > 0.15 {
-		d.logs.Add(now, "WARN", "power", fmt.Sprintf("PSU1 12V rail at %.3fV, outside +/-0.15V", psu))
+
+	psu := v["psu_voltage_v"]
+	dev := math.Abs(psu - 12)
+	if dev > psuWarnV {
+		d.logs.Add(now, "WARN", "power", fmt.Sprintf("PSU1 12V rail at %.3fV, outside +/-%.2fV", psu, psuWarnV))
 	}
+	switch {
+	case !d.psuFault && dev >= psuAlertV:
+		d.psuFault = true
+		started = append(started, alertSignal{
+			code: wire.AlertPSURail, severity: wire.SeverityWarning, value: psu, wantsBundle: true,
+			message: fmt.Sprintf("PSU1 12V rail at %.3fV, outside +/-%.2fV", psu, psuAlertV),
+		})
+	case d.psuFault && dev < psuClearV:
+		d.psuFault = false
+	}
+
 	if tick%12 == 0 {
 		d.logs.Add(now, "INFO", "telemetry", fmt.Sprintf("sampled %d metrics, %d samples buffered", len(samples), d.buf.Len()))
 	}
-
-	inFault := temp >= thermalFaultC
-	faultStarted = inFault && !d.inFault
-	d.inFault = inFault
-	return faultStarted
+	return started
 }
 
-func (d *Device) maybeCollect(now time.Time, faultStarted bool) {
-	if d.uploader == nil {
+// maybeCollect collects a scheduled bundle when one is due.
+func (d *Device) maybeCollect(now time.Time) {
+	if d.uploader == nil || d.bundleCfg.Interval <= 0 || now.Before(d.nextBundle) {
 		return
 	}
-	if faultStarted && (d.lastAlertBundle.IsZero() || now.Sub(d.lastAlertBundle) >= d.bundleCfg.AlertCooldown) {
-		d.lastAlertBundle = now
-		d.collect(now, wire.ReasonAlert)
-	}
-	if d.bundleCfg.Interval > 0 && !now.Before(d.nextBundle) {
-		d.nextBundle = now.Add(d.bundleCfg.Interval)
-		d.collect(now, wire.ReasonScheduled)
-	}
+	d.nextBundle = now.Add(d.bundleCfg.Interval)
+	d.collect(now, wire.ReasonScheduled)
 }
 
 // collect builds a bundle from the current logs and hands it to the uploader.
-func (d *Device) collect(now time.Time, reason wire.BundleReason) {
+// It returns the bundle ID, or "" if the bundle couldn't be built or spooled.
+func (d *Device) collect(now time.Time, reason wire.BundleReason) string {
 	data, err := buildBundle(bundleInput{
 		DeviceID: d.id, Model: d.model, Firmware: d.firmware, Site: d.site,
 		Reason: reason, CollectedAt: now, Logs: d.logs.Snapshot(),
@@ -169,7 +192,7 @@ func (d *Device) collect(now time.Time, reason wire.BundleReason) {
 	})
 	if err != nil {
 		d.log.Error("building log bundle failed", "reason", reason, "err", err)
-		return
+		return ""
 	}
 	sum := sha256.Sum256(data)
 	req := wire.BundleInitRequest{
@@ -178,10 +201,11 @@ func (d *Device) collect(now time.Time, reason wire.BundleReason) {
 	}
 	if err := d.uploader.Submit(req, data); err != nil {
 		d.log.Error("spooling log bundle failed", "bundle_id", req.BundleID, "err", err)
-		return
+		return ""
 	}
 	d.logs.Add(now, "INFO", "support", fmt.Sprintf("collected %s log bundle %s (%d bytes)", reason, req.BundleID, len(data)))
 	d.log.Info("log bundle collected", "bundle_id", req.BundleID, "reason", reason, "bytes", len(data))
+	return req.BundleID
 }
 
 // flush sends the pending batch, or cuts a new one from the buffer. A batch

@@ -16,6 +16,12 @@ type metrics struct {
 	sendDuration      prometheus.Histogram
 	heartbeatFailures *prometheus.CounterVec
 
+	alertsRaised      *prometheus.CounterVec
+	alertsSent        prometheus.Counter
+	alertsRejected    prometheus.Counter
+	alertsDropped     prometheus.Counter
+	alertSendFailures *prometheus.CounterVec
+
 	bundlesCreated       *prometheus.CounterVec
 	bundleUploads        *prometheus.CounterVec
 	bundleUploadFailures *prometheus.CounterVec
@@ -63,6 +69,27 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 		heartbeatFailures: f.NewCounterVec(prometheus.CounterOpts{
 			Name: "connectivity_agent_heartbeat_failures_total",
 			Help: "Failed heartbeats, by reason.",
+		}, []string{"reason"}),
+
+		alertsRaised: f.NewCounterVec(prometheus.CounterOpts{
+			Name: "connectivity_agent_alerts_raised_total",
+			Help: "Faults detected and queued as alerts, by code.",
+		}, []string{"code"}),
+		alertsSent: f.NewCounter(prometheus.CounterOpts{
+			Name: "connectivity_agent_alerts_sent_total",
+			Help: "Alerts acknowledged by the cloud or the gateway.",
+		}),
+		alertsRejected: f.NewCounter(prometheus.CounterOpts{
+			Name: "connectivity_agent_alerts_rejected_total",
+			Help: "Alerts the backend refused permanently (4xx) and the agent dropped.",
+		}),
+		alertsDropped: f.NewCounter(prometheus.CounterOpts{
+			Name: "connectivity_agent_alerts_dropped_total",
+			Help: "Alerts discarded because the outbox was full. These faults never reach support.",
+		}),
+		alertSendFailures: f.NewCounterVec(prometheus.CounterOpts{
+			Name: "connectivity_agent_alert_send_failures_total",
+			Help: "Failed alert sends that will be retried, by reason.",
 		}, []string{"reason"}),
 
 		bundlesCreated: f.NewCounterVec(prometheus.CounterOpts{

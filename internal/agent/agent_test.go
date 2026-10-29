@@ -14,7 +14,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
-	"github.com/spr732/connectivity-contracts/wire"
+	"github.com/shubhampatel19/connectivity-contracts/wire"
 )
 
 func samples(n int) []wire.Sample {

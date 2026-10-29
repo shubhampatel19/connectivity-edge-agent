@@ -24,7 +24,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
-	"github.com/spr732/connectivity-contracts/wire"
+	"github.com/shubhampatel19/connectivity-contracts/wire"
 )
 
 var quiet = slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -359,24 +359,52 @@ func TestBuildBundleContents(t *testing.T) {
 	}
 }
 
-func TestObserveLogsAndDetectsFaultEdge(t *testing.T) {
-	d := &Device{logs: NewLogRing(50), buf: NewBuffer(10)}
+func TestObserveRaisesEachFaultOnceWithHysteresis(t *testing.T) {
+	d := &Device{logs: NewLogRing(100), buf: NewBuffer(10)}
 	now := time.Now()
-	read := func(temp float64) []wire.Sample {
-		return []wire.Sample{{Metric: "cpu_temp_c", Value: temp}, {Metric: "psu_voltage_v", Value: 12}}
+	read := func(temp, psu, disk float64) []wire.Sample {
+		return []wire.Sample{
+			{Metric: "cpu_temp_c", Value: temp}, {Metric: "psu_voltage_v", Value: psu},
+			{Metric: "disk_reallocated_sectors", Value: disk},
+		}
 	}
-	if d.observe(now, 1, read(60)) {
-		t.Fatal("normal temperature is not a fault")
+	codes := func(sigs []alertSignal) string {
+		var out []string
+		for _, s := range sigs {
+			out = append(out, string(s.code))
+		}
+		return strings.Join(out, ",")
 	}
-	if !d.observe(now, 2, read(93)) {
-		t.Fatal("crossing the fault threshold should report a fault start")
+	steps := []struct {
+		temp, psu, disk float64
+		want            string
+	}{
+		{60, 12, 0, ""},
+		{93, 12, 0, "thermal.critical"}, // crosses the fault threshold
+		{95, 12, 0, ""},                 // still in fault
+		{87, 12, 0, ""},                 // under 90 but not under 85: not cleared, no new alert
+		{93, 12, 0, ""},                 // so this is the same fault
+		{84, 12, 0, ""},                 // cleared
+		{91, 12, 0, "thermal.critical"}, // a new fault
+		{60, 11.79, 0, "power.rail_out_of_range"},
+		{60, 11.83, 0, ""}, // 0.17V off: still in fault
+		{60, 11.78, 0, ""}, // same sag
+		{60, 11.9, 0, ""},  // cleared
+		{60, 12.21, 0, "power.rail_out_of_range"},
+		{60, 12, 1, "storage.reallocated_sectors"},
+		{60, 12, 1, ""}, // count didn't rise
 	}
-	if d.observe(now, 3, read(95)) {
-		t.Fatal("staying in fault is not a new fault")
+	for i, st := range steps {
+		got := codes(d.observe(now, i+1, read(st.temp, st.psu, st.disk)))
+		if got != st.want {
+			t.Fatalf("step %d (temp %.0f, psu %.2f, disk %.0f): raised %q, want %q", i, st.temp, st.psu, st.disk, got, st.want)
+		}
 	}
 	logs := strings.Join(d.logs.Snapshot(), "\n")
-	if !strings.Contains(logs, "ERROR [thermal]") {
-		t.Fatalf("expected thermal errors in the system log, got:\n%s", logs)
+	for _, want := range []string{"ERROR [thermal]", "thermal fault cleared", "[power] PSU1", "[storage] disk0"} {
+		if !strings.Contains(logs, want) {
+			t.Fatalf("expected %q in the system log, got:\n%s", want, logs)
+		}
 	}
 }
 

@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/spr732/connectivity-contracts/wire"
+	"github.com/shubhampatel19/connectivity-contracts/wire"
 )
 
 var ErrUnauthorized = errors.New("unauthorized")
@@ -27,8 +27,8 @@ type StatusError struct {
 
 func (e *StatusError) Error() string { return fmt.Sprintf("backend returned %d: %s", e.Code, e.Body) }
 
-// Client talks to the ingest API (directly now; through the site gateway in
-// a later phase). One Client is shared by every simulated device in the
+// Client talks to the ingest API, directly or through the site gateway, which
+// serves the same API. One Client is shared by every simulated device in the
 // process, the same way a real gateway multiplexes many devices onto one
 // upstream.
 type Client struct {
@@ -56,6 +56,10 @@ func (c *Client) Register(ctx context.Context, req wire.RegisterRequest) (string
 
 func (c *Client) SendTelemetry(ctx context.Context, deviceID, token string, b wire.TelemetryBatch) error {
 	return c.postJSON(ctx, "/v1/telemetry", deviceHeaders(deviceID, token), b, nil)
+}
+
+func (c *Client) SendAlert(ctx context.Context, deviceID, token string, a wire.DeviceAlert) error {
+	return c.postJSON(ctx, "/v1/alerts", deviceHeaders(deviceID, token), a, nil)
 }
 
 func (c *Client) Heartbeat(ctx context.Context, deviceID, token string) error {

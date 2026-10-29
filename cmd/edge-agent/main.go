@@ -5,14 +5,16 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
-	"github.com/spr732/connectivity-contracts/wire"
-	"github.com/spr732/connectivity-edge-agent/internal/agent"
-	"github.com/spr732/connectivity-go-kit/platform"
+	"github.com/shubhampatel19/connectivity-contracts/wire"
+	"github.com/shubhampatel19/connectivity-edge-agent/internal/agent"
+	"github.com/shubhampatel19/connectivity-go-kit/platform"
 )
 
 func main() {
@@ -39,6 +41,8 @@ func run(log *slog.Logger) error {
 	httpTimeout := env.Duration("HTTP_TIMEOUT", 10*time.Second)
 	metricsAddr := env.String("METRICS_ADDR", ":9102")
 	logLines := env.Int("LOG_LINES", 1000)
+	alertQueue := env.Int("ALERT_QUEUE_CAPACITY", 100)
+	faultRate, faultRateErr := strconv.ParseFloat(env.String("FAULT_RATE", "1"), 64)
 
 	bundleInterval := env.Duration("BUNDLE_INTERVAL", 30*time.Minute)
 	alertCooldown := env.Duration("ALERT_BUNDLE_COOLDOWN", 10*time.Minute)
@@ -53,6 +57,8 @@ func run(log *slog.Logger) error {
 	env.Check(bufferCap > 0, "BUFFER_CAPACITY must be positive")
 	env.Check(maxDrain > 0, "MAX_DRAIN_BATCHES must be positive")
 	env.Check(logLines > 0, "LOG_LINES must be positive")
+	env.Check(alertQueue > 0, "ALERT_QUEUE_CAPACITY must be positive")
+	env.Check(faultRateErr == nil && faultRate >= 0, "FAULT_RATE must be a number, 0 or more")
 	env.Check(bundleInterval >= 0, "BUNDLE_INTERVAL must not be negative")
 	env.Check(traceBytes >= 0, "BUNDLE_TRACE_BYTES must not be negative")
 	env.Check(spoolMax > 0, "SPOOL_MAX_BUNDLES must be positive")
@@ -77,7 +83,9 @@ func run(log *slog.Logger) error {
 			HeartbeatEvery:  heartbeatEvery,
 			MaxBatch:        maxBatch,
 			MaxDrainBatches: maxDrain,
+			AlertQueue:      alertQueue,
 		},
+		FaultRate: faultRate,
 		Bundles: agent.BundleConfig{
 			Interval:      bundleInterval,
 			AlertCooldown: alertCooldown,
@@ -94,7 +102,10 @@ func run(log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	go func() {
-		if err := platform.Serve(ctx, log, metricsAddr, platform.MetricsHandler(reg)); err != nil {
+		mux := http.NewServeMux()
+		mux.Handle("GET /metrics", platform.MetricsHandler(reg))
+		mux.Handle("POST /debug/faults", fleet.FaultHandler())
+		if err := platform.Serve(ctx, log, metricsAddr, mux); err != nil {
 			log.Error("metrics server failed", "err", err)
 			stop()
 		}

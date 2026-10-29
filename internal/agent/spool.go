@@ -12,7 +12,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/spr732/connectivity-contracts/wire"
+	"github.com/shubhampatel19/connectivity-contracts/wire"
 )
 
 // Spool keeps collected bundles on local disk until the cloud confirms them,

@@ -3,7 +3,7 @@ package agent
 import (
 	"sync"
 
-	"github.com/spr732/connectivity-contracts/wire"
+	"github.com/shubhampatel19/connectivity-contracts/wire"
 )
 
 // Buffer is a bounded ring of samples waiting to be sent. When the backend is

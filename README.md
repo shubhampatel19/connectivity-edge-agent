@@ -2,17 +2,56 @@
 
 Simulates a fleet of field devices streaming hardware telemetry to the cloud. Each device is a goroutine with its own sensors, local buffer and credentials, so one process can stand in for thousands of devices.
 
-Part of [Connectivity](https://github.com/spr732/connectivity-platform), a mock edge-to-cloud telemetry system built for practicing production debugging.
+Part of [Connectivity](https://github.com/shubhampatel19/connectivity-platform), a mock edge-to-cloud telemetry system built for practicing production debugging.
 
 ## What each device does
 
 1. Starts at a random offset inside the send interval, so the fleet doesn't tick in lockstep.
 2. Registers with the enrollment key and receives a device token, retrying with jittered exponential backoff.
-3. Every tick, reads its sensors (CPU temperature, fan speed, PSU voltage, memory, reallocated disk sectors) into a bounded buffer. Occasionally a device enters an overheat episode.
-4. Sends buffered samples as a batch. The batch keeps its ID across retries so the backend can deduplicate it.
-5. Sends a heartbeat every few ticks, and re-registers if its credentials are rejected.
-6. Keeps a rolling system log of what happens to it: thermal warnings, failing disk sectors, PSU drift, network errors.
-7. Collects a log bundle on a schedule, and immediately when CPU temperature crosses the fault threshold.
+3. Every tick, reads its sensors (CPU temperature, fan speed, PSU voltage, memory, reallocated disk sectors) into a bounded buffer. Now and then a device overheats, its PSU rail sags, or its disk reallocates sectors.
+4. Raises an alert when a fault starts, and sends queued alerts before telemetry.
+5. Sends buffered samples as a batch. The batch keeps its ID across retries so the backend can deduplicate it.
+6. Sends a heartbeat every few ticks, and re-registers if its credentials are rejected.
+7. Keeps a rolling system log of what happens to it: thermal warnings, failing disk sectors, PSU drift, network errors.
+8. Collects a log bundle on a schedule, and immediately when a thermal or PSU fault starts.
+
+## Faults and alerts
+
+| Fault | Starts when | Clears when | Alert | Log bundle |
+|---|---|---|---|---|
+| Overheat | CPU ≥ 90°C | CPU < 85°C | `thermal.critical`, critical | yes |
+| PSU sag | 12V rail ≥ 0.20V off | rail < 0.15V off | `power.rail_out_of_range`, warning | yes |
+| Disk wear | reallocated sector count rises | — | `storage.reallocated_sectors`, warning, value = count | no |
+
+Each fault raises one alert when it starts. The gap between the start and clear thresholds (hysteresis) stops a noisy reading from raising a new alert every time it wobbles across the line. A sagging rail sits right at the threshold, so a sag still flaps and raises several alerts; the case service's rules are what tell a flapping rail from one stray reading.
+
+How often faults happen on their own: an overheat or a PSU sag about once an hour across 300 devices at the default interval, and about 2% of devices have a degrading disk that keeps reallocating. `FAULT_RATE` scales all of it; `0` leaves only injected faults.
+
+**Alerts carry their bundle.** When a fault wants logs, the device collects a bundle first and puts its ID on the alert, so the cloud can attach the logs to the case. Within `ALERT_BUNDLE_COOLDOWN` of the last alert bundle, the alert goes without one.
+
+**The outbox.** Alerts wait in a per-device queue until the cloud (or the gateway) acknowledges them, and keep their `alert_id` across retries so the cloud can deduplicate.
+
+| Alert send outcome | What the agent does |
+|---|---|
+| 5xx, timeout, network error, 429 | Keeps the alert and retries next tick |
+| 404 / 405 | Keeps it: the cloud predates alerts. An agent upgraded before the cloud must not throw its faults away |
+| Other 4xx | Drops it, because it can never succeed, and counts it |
+| 401 | Re-registers, then retries |
+| Outbox full (`ALERT_QUEUE_CAPACITY`) | Drops the oldest alert and counts it |
+
+The outbox is in memory, so an agent restart loses alerts it hasn't sent. That is a deliberate gap: the bundle spool is on disk, the outbox isn't. Drill material.
+
+## Injecting faults
+
+For drills and CI, the metrics port also takes fault requests:
+
+```bash
+curl -X POST 'localhost:9102/debug/faults?kind=thermal'                  # one random device
+curl -X POST 'localhost:9102/debug/faults?kind=thermal&devices=all'      # every device in this process: a site-wide cooling failure
+curl -X POST 'localhost:9102/debug/faults?kind=psu&device=site-a-00007'  # one named device
+```
+
+`kind` is `thermal`, `psu` or `disk`. The response lists the devices hit. The fault starts on each device's next reading; an overheat takes about 15 readings to cross 90°C.
 
 ## Log bundles
 
@@ -57,6 +96,8 @@ Bundles from every device go to one on-disk spool and are uploaded by a shared w
 | `HTTP_TIMEOUT` | `10s` |
 | `METRICS_ADDR` | `:9102` |
 | `LOG_LINES` | `1000` lines of system log per device |
+| `ALERT_QUEUE_CAPACITY` | `100` alerts per device |
+| `FAULT_RATE` | `1` (scales natural faults; `0` = injected only) |
 | `BUNDLE_INTERVAL` | `30m` (`0` disables scheduled bundles) |
 | `ALERT_BUNDLE_COOLDOWN` | `10m` between alert bundles per device |
 | `BUNDLE_TRACE_BYTES` | `2097152` (about 1 MB per bundle after compression) |
@@ -64,4 +105,4 @@ Bundles from every device go to one on-disk spool and are uploaded by a shared w
 | `SPOOL_MAX_BUNDLES` | `200` |
 | `UPLOAD_CONCURRENCY` | `4` |
 
-Metrics are exposed at `/metrics` with the `connectivity_agent_` prefix.
+Metrics are exposed at `/metrics` with the `connectivity_agent_` prefix. Alerts: `alerts_raised_total{code}`, `alerts_sent_total`, `alert_send_failures_total{reason}`, `alerts_rejected_total`, `alerts_dropped_total`, and the `alerts_pending` gauge.
