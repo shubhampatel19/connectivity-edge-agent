@@ -3,6 +3,8 @@ package agent
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,9 +27,10 @@ type StatusError struct {
 
 func (e *StatusError) Error() string { return fmt.Sprintf("backend returned %d: %s", e.Code, e.Body) }
 
-// Client talks to ingestion (directly now; through the site gateway in a later
-// phase). One Client is shared by every simulated device in the process, the
-// same way a real gateway multiplexes many devices onto one upstream.
+// Client talks to the ingest API (directly now; through the site gateway in
+// a later phase). One Client is shared by every simulated device in the
+// process, the same way a real gateway multiplexes many devices onto one
+// upstream.
 type Client struct {
 	base          string
 	enrollmentKey string
@@ -47,32 +50,56 @@ func NewClient(baseURL, enrollmentKey string, timeout time.Duration) *Client {
 
 func (c *Client) Register(ctx context.Context, req wire.RegisterRequest) (string, error) {
 	var resp wire.RegisterResponse
-	err := c.post(ctx, "/v1/register", map[string]string{"X-Enrollment-Key": c.enrollmentKey}, req, &resp)
+	err := c.postJSON(ctx, "/v1/register", map[string]string{"X-Enrollment-Key": c.enrollmentKey}, req, &resp)
 	return resp.Token, err
 }
 
 func (c *Client) SendTelemetry(ctx context.Context, deviceID, token string, b wire.TelemetryBatch) error {
-	return c.post(ctx, "/v1/telemetry", deviceHeaders(deviceID, token), b, nil)
+	return c.postJSON(ctx, "/v1/telemetry", deviceHeaders(deviceID, token), b, nil)
 }
 
 func (c *Client) Heartbeat(ctx context.Context, deviceID, token string) error {
-	return c.post(ctx, "/v1/heartbeat", deviceHeaders(deviceID, token), struct{}{}, nil)
+	return c.postJSON(ctx, "/v1/heartbeat", deviceHeaders(deviceID, token), struct{}{}, nil)
+}
+
+func (c *Client) InitBundle(ctx context.Context, deviceID, token string, req wire.BundleInitRequest) (wire.BundleStatus, error) {
+	var st wire.BundleStatus
+	err := c.postJSON(ctx, "/v1/bundles", deviceHeaders(deviceID, token), req, &st)
+	return st, err
+}
+
+func (c *Client) UploadChunk(ctx context.Context, deviceID, token, bundleID string, index int, data []byte) error {
+	sum := sha256.Sum256(data)
+	h := deviceHeaders(deviceID, token)
+	h[wire.HeaderChunkSHA256] = hex.EncodeToString(sum[:])
+	path := fmt.Sprintf("/v1/bundles/%s/chunks/%d", bundleID, index)
+	return c.do(ctx, http.MethodPut, path, h, "application/octet-stream", bytes.NewReader(data), nil)
+}
+
+func (c *Client) CompleteBundle(ctx context.Context, deviceID, token, bundleID string) (wire.BundleStatus, error) {
+	var st wire.BundleStatus
+	err := c.postJSON(ctx, "/v1/bundles/"+bundleID+"/complete", deviceHeaders(deviceID, token), struct{}{}, &st)
+	return st, err
 }
 
 func deviceHeaders(deviceID, token string) map[string]string {
 	return map[string]string{"X-Device-ID": deviceID, "Authorization": "Bearer " + token}
 }
 
-func (c *Client) post(ctx context.Context, path string, headers map[string]string, body, out any) error {
+func (c *Client) postJSON(ctx context.Context, path string, headers map[string]string, body, out any) error {
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+path, bytes.NewReader(payload))
+	return c.do(ctx, http.MethodPost, path, headers, "application/json", bytes.NewReader(payload), out)
+}
+
+func (c *Client) do(ctx context.Context, method, path string, headers map[string]string, contentType string, body io.Reader, out any) error {
+	req, err := http.NewRequestWithContext(ctx, method, c.base+path, body)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Type", contentType)
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
@@ -99,9 +126,9 @@ func (c *Client) post(ctx context.Context, path string, headers map[string]strin
 	return nil
 }
 
-// isPermanent reports whether retrying the same request can never succeed.
-// Retrying those forever would wedge the device's send queue behind one bad
-// batch.
+// isPermanent reports whether retrying the same telemetry request can never
+// succeed. Retrying those forever would wedge the device's send queue behind
+// one bad batch.
 func isPermanent(err error) bool {
 	var se *StatusError
 	if !errors.As(err, &se) {

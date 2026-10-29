@@ -3,15 +3,24 @@ package agent
 import (
 	"context"
 	crand "crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"log/slog"
+	"math"
 	"math/rand/v2"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/spr732/connectivity-contracts/wire"
+)
+
+const (
+	thermalWarnC  = 80.0
+	thermalFaultC = 90.0
 )
 
 type DeviceConfig struct {
@@ -21,21 +30,53 @@ type DeviceConfig struct {
 	MaxDrainBatches int // batches a device may send per tick while catching up
 }
 
+// BundleConfig controls log bundle collection. A zero Interval disables
+// scheduled bundles; alert bundles still fire on thermal faults.
+type BundleConfig struct {
+	Interval      time.Duration
+	AlertCooldown time.Duration
+	TraceBytes    int
+}
+
 // Device is one simulated field device running in its own goroutine.
 type Device struct {
 	id, model, firmware, site string
 
-	cfg     DeviceConfig
-	client  *Client
-	sensors *Sensors
-	buf     *Buffer
-	m       *metrics
-	log     *slog.Logger
-	rng     *rand.Rand
+	cfg       DeviceConfig
+	bundleCfg BundleConfig
+	client    *Client
+	uploader  *Uploader // nil disables log bundles
+	sensors   *Sensors
+	buf       *Buffer
+	logs      *LogRing
+	m         *metrics
+	log       *slog.Logger
+	rng       *rand.Rand
 
-	token      string
+	tokenMu sync.RWMutex
+	token   string
+
 	pending    *wire.TelemetryBatch // sent but not yet acknowledged
 	hasPending atomic.Bool
+
+	nextBundle      time.Time
+	lastAlertBundle time.Time
+	inFault         bool
+	lastReallocated float64
+}
+
+// Token returns the device's current credential. The uploader reads it from
+// other goroutines.
+func (d *Device) Token() string {
+	d.tokenMu.RLock()
+	defer d.tokenMu.RUnlock()
+	return d.token
+}
+
+func (d *Device) setToken(t string) {
+	d.tokenMu.Lock()
+	d.token = t
+	d.tokenMu.Unlock()
 }
 
 // Run registers the device, then reads sensors and ships telemetry every tick
@@ -49,6 +90,9 @@ func (d *Device) Run(ctx context.Context) {
 	if !d.register(ctx) {
 		return
 	}
+	if d.bundleCfg.Interval > 0 {
+		d.nextBundle = time.Now().Add(time.Duration(d.rng.Int64N(int64(d.bundleCfg.Interval))))
+	}
 
 	ticker := time.NewTicker(d.cfg.SendInterval)
 	defer ticker.Stop()
@@ -57,15 +101,87 @@ func (d *Device) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case now := <-ticker.C:
-			if dropped := d.buf.Push(d.sensors.Read(now)...); dropped > 0 {
+			samples := d.sensors.Read(now)
+			if dropped := d.buf.Push(samples...); dropped > 0 {
 				d.m.samplesDropped.Add(float64(dropped))
 			}
+			faultStarted := d.observe(now, tick, samples)
 			d.flush(ctx)
 			if tick%d.cfg.HeartbeatEvery == 0 {
 				d.heartbeat(ctx)
 			}
+			d.maybeCollect(now, faultStarted)
 		}
 	}
+}
+
+// observe writes what a real device's system log would say about these
+// readings. It reports whether a thermal fault just started.
+func (d *Device) observe(now time.Time, tick int, samples []wire.Sample) (faultStarted bool) {
+	v := make(map[string]float64, len(samples))
+	for _, s := range samples {
+		v[s.Metric] = s.Value
+	}
+	temp, fan := v["cpu_temp_c"], v["fan_rpm"]
+	switch {
+	case temp >= thermalFaultC:
+		d.logs.Add(now, "ERROR", "thermal", fmt.Sprintf("cpu_temp=%.1fC over fault threshold %.0fC, fan=%.0frpm, throttling CPU", temp, thermalFaultC, fan))
+	case temp >= thermalWarnC:
+		d.logs.Add(now, "WARN", "thermal", fmt.Sprintf("cpu_temp=%.1fC over %.0fC, fan=%.0frpm", temp, thermalWarnC, fan))
+	}
+	if r := v["disk_reallocated_sectors"]; r > d.lastReallocated {
+		d.logs.Add(now, "WARN", "storage", fmt.Sprintf("disk0 reallocated sector count rose to %.0f", r))
+		d.lastReallocated = r
+	}
+	if psu := v["psu_voltage_v"]; math.Abs(psu-12) > 0.15 {
+		d.logs.Add(now, "WARN", "power", fmt.Sprintf("PSU1 12V rail at %.3fV, outside +/-0.15V", psu))
+	}
+	if tick%12 == 0 {
+		d.logs.Add(now, "INFO", "telemetry", fmt.Sprintf("sampled %d metrics, %d samples buffered", len(samples), d.buf.Len()))
+	}
+
+	inFault := temp >= thermalFaultC
+	faultStarted = inFault && !d.inFault
+	d.inFault = inFault
+	return faultStarted
+}
+
+func (d *Device) maybeCollect(now time.Time, faultStarted bool) {
+	if d.uploader == nil {
+		return
+	}
+	if faultStarted && (d.lastAlertBundle.IsZero() || now.Sub(d.lastAlertBundle) >= d.bundleCfg.AlertCooldown) {
+		d.lastAlertBundle = now
+		d.collect(now, wire.ReasonAlert)
+	}
+	if d.bundleCfg.Interval > 0 && !now.Before(d.nextBundle) {
+		d.nextBundle = now.Add(d.bundleCfg.Interval)
+		d.collect(now, wire.ReasonScheduled)
+	}
+}
+
+// collect builds a bundle from the current logs and hands it to the uploader.
+func (d *Device) collect(now time.Time, reason wire.BundleReason) {
+	data, err := buildBundle(bundleInput{
+		DeviceID: d.id, Model: d.model, Firmware: d.firmware, Site: d.site,
+		Reason: reason, CollectedAt: now, Logs: d.logs.Snapshot(),
+		TraceBytes: d.bundleCfg.TraceBytes, Rng: d.rng,
+	})
+	if err != nil {
+		d.log.Error("building log bundle failed", "reason", reason, "err", err)
+		return
+	}
+	sum := sha256.Sum256(data)
+	req := wire.BundleInitRequest{
+		BundleID: newBatchID(), DeviceID: d.id, SizeBytes: int64(len(data)),
+		SHA256: hex.EncodeToString(sum[:]), Reason: reason, CollectedAt: now.UTC(),
+	}
+	if err := d.uploader.Submit(req, data); err != nil {
+		d.log.Error("spooling log bundle failed", "bundle_id", req.BundleID, "err", err)
+		return
+	}
+	d.logs.Add(now, "INFO", "support", fmt.Sprintf("collected %s log bundle %s (%d bytes)", reason, req.BundleID, len(data)))
+	d.log.Info("log bundle collected", "bundle_id", req.BundleID, "reason", reason, "bytes", len(data))
 }
 
 // flush sends the pending batch, or cuts a new one from the buffer. A batch
@@ -83,7 +199,7 @@ func (d *Device) flush(ctx context.Context) {
 		}
 
 		start := time.Now()
-		err := d.client.SendTelemetry(ctx, d.id, d.token, *d.pending)
+		err := d.client.SendTelemetry(ctx, d.id, d.Token(), *d.pending)
 		d.m.sendDuration.Observe(time.Since(start).Seconds())
 
 		switch {
@@ -102,6 +218,7 @@ func (d *Device) flush(ctx context.Context) {
 			d.m.batchesRejected.Inc()
 			d.log.Error("backend rejected batch permanently, dropping it",
 				"batch_id", d.pending.BatchID, "samples", len(d.pending.Samples), "err", err)
+			d.logs.Add(time.Now(), "ERROR", "connectivity", fmt.Sprintf("telemetry batch rejected by cloud: %v", err))
 			d.clearPending()
 			continue
 		default:
@@ -109,6 +226,7 @@ func (d *Device) flush(ctx context.Context) {
 			d.m.sendFailures.WithLabelValues(reason).Inc()
 			d.log.Warn("send failed, will retry next tick",
 				"batch_id", d.pending.BatchID, "reason", reason, "err", err)
+			d.logs.Add(time.Now(), "WARN", "connectivity", fmt.Sprintf("telemetry upload failed (%s), %d samples buffered", reason, d.buf.Len()))
 		}
 		return
 	}
@@ -120,7 +238,7 @@ func (d *Device) clearPending() {
 }
 
 func (d *Device) heartbeat(ctx context.Context) {
-	err := d.client.Heartbeat(ctx, d.id, d.token)
+	err := d.client.Heartbeat(ctx, d.id, d.Token())
 	switch {
 	case err == nil, ctx.Err() != nil:
 	case errors.Is(err, ErrUnauthorized):
@@ -139,9 +257,10 @@ func (d *Device) register(ctx context.Context) bool {
 	for attempt := 1; ; attempt++ {
 		token, err := d.client.Register(ctx, req)
 		if err == nil {
-			d.token = token
+			d.setToken(token)
 			d.m.registrations.Inc()
 			d.log.Info("registered", "attempt", attempt)
+			d.logs.Add(time.Now(), "INFO", "connectivity", "registered with cloud")
 			return true
 		}
 		if ctx.Err() != nil {

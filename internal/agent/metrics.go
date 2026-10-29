@@ -15,6 +15,13 @@ type metrics struct {
 	sendFailures      *prometheus.CounterVec
 	sendDuration      prometheus.Histogram
 	heartbeatFailures *prometheus.CounterVec
+
+	bundlesCreated       *prometheus.CounterVec
+	bundleUploads        *prometheus.CounterVec
+	bundleUploadFailures *prometheus.CounterVec
+	bundleBytes          prometheus.Counter
+	chunkDuration        prometheus.Histogram
+	bundleUploadDuration prometheus.Histogram
 }
 
 func newMetrics(reg prometheus.Registerer) *metrics {
@@ -57,5 +64,32 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 			Name: "connectivity_agent_heartbeat_failures_total",
 			Help: "Failed heartbeats, by reason.",
 		}, []string{"reason"}),
+
+		bundlesCreated: f.NewCounterVec(prometheus.CounterOpts{
+			Name: "connectivity_agent_bundles_created_total",
+			Help: "Log bundles collected and spooled, by reason.",
+		}, []string{"reason"}),
+		bundleUploads: f.NewCounterVec(prometheus.CounterOpts{
+			Name: "connectivity_agent_bundle_uploads_total",
+			Help: "Bundles that left the spool, by result (completed, rejected, evicted).",
+		}, []string{"result"}),
+		bundleUploadFailures: f.NewCounterVec(prometheus.CounterOpts{
+			Name: "connectivity_agent_bundle_upload_failures_total",
+			Help: "Upload attempts that failed and will be retried, by reason.",
+		}, []string{"reason"}),
+		bundleBytes: f.NewCounter(prometheus.CounterOpts{
+			Name: "connectivity_agent_bundle_bytes_uploaded_total",
+			Help: "Bundle bytes accepted by the cloud, counted per chunk.",
+		}),
+		chunkDuration: f.NewHistogram(prometheus.HistogramOpts{
+			Name:    "connectivity_agent_bundle_chunk_duration_seconds",
+			Help:    "Time to upload one bundle chunk.",
+			Buckets: []float64{.01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10},
+		}),
+		bundleUploadDuration: f.NewHistogram(prometheus.HistogramOpts{
+			Name:    "connectivity_agent_bundle_upload_duration_seconds",
+			Help:    "Time from init to complete for a successful upload attempt.",
+			Buckets: []float64{.1, .25, .5, 1, 2.5, 5, 10, 30, 60, 120},
+		}),
 	}
 }
