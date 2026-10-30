@@ -8,7 +8,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/shubhampatel19/connectivity-contracts/wire"
+	"github.com/shubhampatel19/connectivity-go-kit/platform"
 )
 
 // Fault thresholds. Each fault has hysteresis: it starts at one threshold and
@@ -134,7 +138,15 @@ func (d *Device) sendAlerts(ctx context.Context) {
 		if !ok {
 			return
 		}
-		err := d.client.SendAlert(ctx, d.id, d.Token(), a)
+		actx, span := platform.Tracer().Start(ctx, "send alert", trace.WithAttributes(
+			attribute.String("device.id", d.id),
+			attribute.String("site.id", d.site),
+			attribute.String("alert.id", a.AlertID),
+			attribute.String("alert.code", string(a.Code)),
+		))
+		err := d.client.SendAlert(actx, d.id, d.Token(), a)
+		platform.RecordError(actx, err)
+		span.End()
 		switch {
 		case err == nil:
 			d.alerts.pop()
@@ -153,13 +165,13 @@ func (d *Device) sendAlerts(ctx context.Context) {
 		case isPermanent(err):
 			d.alerts.pop()
 			d.m.alertsRejected.Inc()
-			d.log.Error("backend rejected alert permanently, dropping it", "alert_id", a.AlertID, "code", a.Code, "err", err)
+			d.log.ErrorContext(actx, "backend rejected alert permanently, dropping it", "alert_id", a.AlertID, "code", a.Code, "err", err)
 			d.logs.Add(time.Now(), "ERROR", "support", fmt.Sprintf("alert %s rejected by cloud: %v", a.AlertID, err))
 			continue
 		default:
 			reason := errorReason(err)
 			d.m.alertSendFailures.WithLabelValues(reason).Inc()
-			d.log.Warn("alert send failed, will retry next tick", "alert_id", a.AlertID, "reason", reason, "err", err)
+			d.log.WarnContext(actx, "alert send failed, will retry next tick", "alert_id", a.AlertID, "reason", reason, "err", err)
 		}
 		return
 	}

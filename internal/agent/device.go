@@ -15,7 +15,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/shubhampatel19/connectivity-contracts/wire"
+	"github.com/shubhampatel19/connectivity-go-kit/platform"
 )
 
 type DeviceConfig struct {
@@ -223,7 +227,16 @@ func (d *Device) flush(ctx context.Context) {
 		}
 
 		start := time.Now()
-		err := d.client.SendTelemetry(ctx, d.id, d.Token(), *d.pending)
+		sctx, span := platform.Tracer().Start(ctx, "send telemetry", trace.WithAttributes(
+			attribute.String("device.id", d.id),
+			attribute.String("site.id", d.site),
+			attribute.String("batch.id", d.pending.BatchID),
+			attribute.Int("batch.samples", len(d.pending.Samples)),
+			attribute.Int("buffer.samples", d.buf.Len()),
+		))
+		err := d.client.SendTelemetry(sctx, d.id, d.Token(), *d.pending)
+		platform.RecordError(sctx, err)
+		span.End()
 		d.m.sendDuration.Observe(time.Since(start).Seconds())
 
 		switch {
@@ -240,7 +253,7 @@ func (d *Device) flush(ctx context.Context) {
 			d.register(ctx) // the pending batch is retried on the next tick
 		case isPermanent(err):
 			d.m.batchesRejected.Inc()
-			d.log.Error("backend rejected batch permanently, dropping it",
+			d.log.ErrorContext(sctx, "backend rejected batch permanently, dropping it",
 				"batch_id", d.pending.BatchID, "samples", len(d.pending.Samples), "err", err)
 			d.logs.Add(time.Now(), "ERROR", "connectivity", fmt.Sprintf("telemetry batch rejected by cloud: %v", err))
 			d.clearPending()
@@ -248,7 +261,7 @@ func (d *Device) flush(ctx context.Context) {
 		default:
 			reason := errorReason(err)
 			d.m.sendFailures.WithLabelValues(reason).Inc()
-			d.log.Warn("send failed, will retry next tick",
+			d.log.WarnContext(sctx, "send failed, will retry next tick",
 				"batch_id", d.pending.BatchID, "reason", reason, "err", err)
 			d.logs.Add(time.Now(), "WARN", "connectivity", fmt.Sprintf("telemetry upload failed (%s), %d samples buffered", reason, d.buf.Len()))
 		}

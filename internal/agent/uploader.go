@@ -11,7 +11,11 @@ import (
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/shubhampatel19/connectivity-contracts/wire"
+	"github.com/shubhampatel19/connectivity-go-kit/platform"
 )
 
 type UploaderConfig struct {
@@ -189,7 +193,20 @@ func (u *Uploader) process(ctx context.Context, req wire.BundleInitRequest) {
 
 // upload runs the resumable protocol: init (which reports what the cloud
 // already has), send only the missing chunks, then complete.
-func (u *Uploader) upload(ctx context.Context, req wire.BundleInitRequest) error {
+//
+// One span covers the whole attempt, with the init, chunk and complete
+// requests as its children, so a resumed upload shows which chunks it sent.
+func (u *Uploader) upload(ctx context.Context, req wire.BundleInitRequest) (err error) {
+	ctx, span := platform.Tracer().Start(ctx, "upload bundle", trace.WithAttributes(
+		attribute.String("device.id", req.DeviceID),
+		attribute.String("bundle.id", req.BundleID),
+		attribute.String("bundle.reason", string(req.Reason)),
+		attribute.Int64("bundle.bytes", req.SizeBytes),
+	))
+	defer func() {
+		platform.RecordError(ctx, err)
+		span.End()
+	}()
 	token := u.tokenFor(req.DeviceID)
 	if token == "" {
 		return errors.New("device not registered yet")
@@ -211,6 +228,7 @@ func (u *Uploader) upload(ctx context.Context, req wire.BundleInitRequest) error
 		return fmt.Errorf("cloud returned invalid chunk size %d", st.ChunkSize)
 	}
 
+	span.SetAttributes(attribute.Int("bundle.chunks_missing", len(st.Missing())))
 	for _, i := range st.Missing() {
 		n := wire.ChunkLen(req.SizeBytes, st.ChunkSize, i)
 		data, err := u.spool.ReadChunk(req.BundleID, int64(i)*st.ChunkSize, n)

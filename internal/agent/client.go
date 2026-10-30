@@ -14,7 +14,11 @@ import (
 	"strings"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/shubhampatel19/connectivity-contracts/wire"
+	"github.com/shubhampatel19/connectivity-go-kit/platform"
 )
 
 var ErrUnauthorized = errors.New("unauthorized")
@@ -50,25 +54,25 @@ func NewClient(baseURL, enrollmentKey string, timeout time.Duration) *Client {
 
 func (c *Client) Register(ctx context.Context, req wire.RegisterRequest) (string, error) {
 	var resp wire.RegisterResponse
-	err := c.postJSON(ctx, "/v1/register", map[string]string{"X-Enrollment-Key": c.enrollmentKey}, req, &resp)
+	err := c.postJSON(ctx, "/v1/register", "/v1/register", map[string]string{"X-Enrollment-Key": c.enrollmentKey}, req, &resp)
 	return resp.Token, err
 }
 
 func (c *Client) SendTelemetry(ctx context.Context, deviceID, token string, b wire.TelemetryBatch) error {
-	return c.postJSON(ctx, "/v1/telemetry", deviceHeaders(deviceID, token), b, nil)
+	return c.postJSON(ctx, "/v1/telemetry", "/v1/telemetry", deviceHeaders(deviceID, token), b, nil)
 }
 
 func (c *Client) SendAlert(ctx context.Context, deviceID, token string, a wire.DeviceAlert) error {
-	return c.postJSON(ctx, "/v1/alerts", deviceHeaders(deviceID, token), a, nil)
+	return c.postJSON(ctx, "/v1/alerts", "/v1/alerts", deviceHeaders(deviceID, token), a, nil)
 }
 
 func (c *Client) Heartbeat(ctx context.Context, deviceID, token string) error {
-	return c.postJSON(ctx, "/v1/heartbeat", deviceHeaders(deviceID, token), struct{}{}, nil)
+	return c.postJSON(ctx, "/v1/heartbeat", "/v1/heartbeat", deviceHeaders(deviceID, token), struct{}{}, nil)
 }
 
 func (c *Client) InitBundle(ctx context.Context, deviceID, token string, req wire.BundleInitRequest) (wire.BundleStatus, error) {
 	var st wire.BundleStatus
-	err := c.postJSON(ctx, "/v1/bundles", deviceHeaders(deviceID, token), req, &st)
+	err := c.postJSON(ctx, "/v1/bundles", "/v1/bundles", deviceHeaders(deviceID, token), req, &st)
 	return st, err
 }
 
@@ -77,12 +81,12 @@ func (c *Client) UploadChunk(ctx context.Context, deviceID, token, bundleID stri
 	h := deviceHeaders(deviceID, token)
 	h[wire.HeaderChunkSHA256] = hex.EncodeToString(sum[:])
 	path := fmt.Sprintf("/v1/bundles/%s/chunks/%d", bundleID, index)
-	return c.do(ctx, http.MethodPut, path, h, "application/octet-stream", bytes.NewReader(data), nil)
+	return c.do(ctx, http.MethodPut, "/v1/bundles/{bundle_id}/chunks/{index}", path, h, "application/octet-stream", bytes.NewReader(data), nil)
 }
 
 func (c *Client) CompleteBundle(ctx context.Context, deviceID, token, bundleID string) (wire.BundleStatus, error) {
 	var st wire.BundleStatus
-	err := c.postJSON(ctx, "/v1/bundles/"+bundleID+"/complete", deviceHeaders(deviceID, token), struct{}{}, &st)
+	err := c.postJSON(ctx, "/v1/bundles/{bundle_id}/complete", "/v1/bundles/"+bundleID+"/complete", deviceHeaders(deviceID, token), struct{}{}, &st)
 	return st, err
 }
 
@@ -90,15 +94,25 @@ func deviceHeaders(deviceID, token string) map[string]string {
 	return map[string]string{"X-Device-ID": deviceID, "Authorization": "Bearer " + token}
 }
 
-func (c *Client) postJSON(ctx context.Context, path string, headers map[string]string, body, out any) error {
+func (c *Client) postJSON(ctx context.Context, route, path string, headers map[string]string, body, out any) error {
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return err
 	}
-	return c.do(ctx, http.MethodPost, path, headers, "application/json", bytes.NewReader(payload), out)
+	return c.do(ctx, http.MethodPost, route, path, headers, "application/json", bytes.NewReader(payload), out)
 }
 
-func (c *Client) do(ctx context.Context, method, path string, headers map[string]string, contentType string, body io.Reader, out any) error {
+// do sends one request inside a client span named after its route, carrying
+// the trace context in a traceparent header so the cloud continues the trace.
+func (c *Client) do(ctx context.Context, method, route, path string, headers map[string]string, contentType string, body io.Reader, out any) (err error) {
+	ctx, span := platform.Tracer().Start(ctx, method+" "+route,
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(attribute.String("http.request.method", method), attribute.String("url.path", path)))
+	defer func() {
+		platform.RecordError(ctx, err)
+		span.End()
+	}()
+
 	req, err := http.NewRequestWithContext(ctx, method, c.base+path, body)
 	if err != nil {
 		return err
@@ -107,12 +121,14 @@ func (c *Client) do(ctx context.Context, method, path string, headers map[string
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
+	platform.InjectHTTP(ctx, req.Header)
 
 	resp, err := c.hc.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
+	span.SetAttributes(attribute.Int("http.response.status_code", resp.StatusCode))
 
 	if resp.StatusCode == http.StatusUnauthorized {
 		_, _ = io.Copy(io.Discard, resp.Body)

@@ -81,6 +81,12 @@ Bundles from every device go to one on-disk spool and are uploaded by a shared w
 | Buffer full | Overwrites the oldest samples and counts the drops |
 | Backend recovers | Drains the backlog, up to `MAX_DRAIN_BATCHES` per tick |
 
+## Tracing
+
+When `OTEL_EXPORTER_OTLP_ENDPOINT` is set, every telemetry send, alert and bundle upload is a span, and each request under it is a client span whose context goes to the cloud in a `traceparent` header. The cloud continues the same trace. A real device's traces would go out over the same WAN as its data; here they go straight to the cloud's collector, so you can still see failed sends during a WAN fault.
+
+Set `OTEL_TRACES_SAMPLER=parentbased_traceidratio` and `OTEL_TRACES_SAMPLER_ARG=0.1` to trace one send in ten; the cloud follows each trace's decision.
+
 ## Configuration
 
 | Variable | Default |
