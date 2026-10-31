@@ -37,6 +37,7 @@ type alertSignal struct {
 	value       float64
 	message     string
 	wantsBundle bool // collect a log bundle to go with it
+	state       FaultState
 }
 
 // alertQueue is a device's outbox: alerts wait here until the cloud (or the
@@ -87,33 +88,51 @@ func (q *alertQueue) Len() int {
 // them wants logs, one alert bundle is collected first (subject to the
 // cooldown) and its ID goes on those alerts, so the cloud can attach it.
 func (d *Device) raiseAlerts(now time.Time, signals []alertSignal) {
+	for _, a := range d.makeAlerts(now, signals, d.collectAlertBundle, newBatchID) {
+		if dropped := d.alerts.push(a); dropped > 0 {
+			d.m.alertsDropped.Add(float64(dropped))
+			d.log.Warn("alert outbox full, dropped oldest alerts", "dropped", dropped)
+		}
+		d.m.alertsRaised.WithLabelValues(string(a.Code)).Inc()
+		d.log.Info("alert raised", "alert_id", a.AlertID, "code", a.Code, "value", a.Value, "bundle_id", a.BundleID)
+	}
+}
+
+// makeAlerts builds the alerts for this tick's signals, logs them in the
+// system log, and records each one's true cause in the answer key. collect
+// gathers a bundle and returns its ID; the live device spools it for upload,
+// the offline simulator keeps it.
+func (d *Device) makeAlerts(now time.Time, signals []alertSignal, collect func(time.Time) string, newID func() string) []wire.DeviceAlert {
 	if len(signals) == 0 {
-		return
+		return nil
 	}
 	var bundleID string
 	for _, s := range signals {
 		if s.wantsBundle {
-			bundleID = d.collectAlertBundle(now)
+			bundleID = collect(now)
 			break
 		}
 	}
+	out := make([]wire.DeviceAlert, 0, len(signals))
 	for _, s := range signals {
 		a := wire.DeviceAlert{
-			AlertID: newBatchID(), DeviceID: d.id, SiteID: d.site,
+			AlertID: newID(), DeviceID: d.id, SiteID: d.site,
 			Code: s.code, Severity: s.severity, Value: s.value, Message: s.message,
 			ObservedAt: now.UTC(),
 		}
 		if s.wantsBundle {
 			a.BundleID = bundleID
 		}
-		if dropped := d.alerts.push(a); dropped > 0 {
-			d.m.alertsDropped.Add(float64(dropped))
-			d.log.Warn("alert outbox full, dropped oldest alerts", "dropped", dropped)
-		}
-		d.m.alertsRaised.WithLabelValues(string(s.code)).Inc()
 		d.logs.Add(now, "INFO", "support", fmt.Sprintf("raised alert %s %s (value %.3f)", a.Code, a.AlertID, a.Value))
-		d.log.Info("alert raised", "alert_id", a.AlertID, "code", a.Code, "value", a.Value, "bundle_id", a.BundleID)
+		if s.state.Cause != "" {
+			d.faults.Add(FaultRecord{
+				DeviceID: d.id, SiteID: d.site, Fault: s.state.Cause.Fault().String(), Cause: s.state.Cause,
+				Injected: s.state.Injected, AlertID: a.AlertID, BundleID: a.BundleID, ObservedAt: a.ObservedAt,
+			})
+		}
+		out = append(out, a)
 	}
+	return out
 }
 
 // collectAlertBundle collects a log bundle for a fault unless one was

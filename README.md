@@ -8,12 +8,12 @@ Part of [Connectivity](https://github.com/shubhampatel19/connectivity-platform),
 
 1. Starts at a random offset inside the send interval, so the fleet doesn't tick in lockstep.
 2. Registers with the enrollment key and receives a device token, retrying with jittered exponential backoff.
-3. Every tick, reads its sensors (CPU temperature, fan speed, PSU voltage, memory, reallocated disk sectors) into a bounded buffer. Now and then a device overheats, its PSU rail sags, or its disk reallocates sectors.
+3. Every tick, reads its sensors (CPU and inlet temperature, fan speed and duty, PSU rail and AC input voltage, memory, reallocated and pending disk sectors) into a bounded buffer. Now and then a device overheats, its PSU rail sags, or its disk reallocates sectors, each for one of several root causes (see below).
 4. Raises an alert when a fault starts, and sends queued alerts before telemetry.
 5. Sends buffered samples as a batch. The batch keeps its ID across retries so the backend can deduplicate it.
 6. Sends a heartbeat every few ticks, and re-registers if its credentials are rejected.
-7. Keeps a rolling system log of what happens to it: thermal warnings, failing disk sectors, PSU drift, network errors.
-8. Collects a log bundle on a schedule, and immediately when a thermal or PSU fault starts.
+7. Keeps a rolling system log of what happens to it: its firmware's own lines (BMC fan and inlet readings, PSU status, kernel I/O errors, RAID and SMART reports), the agent's threshold warnings, network errors, and the routine chatter every real log carries (time sync, patrol reads, an unplugged port, a certificate nearing expiry).
+8. Collects a log bundle on a schedule, and immediately when a fault starts.
 
 ## Faults and alerts
 
@@ -21,9 +21,26 @@ Part of [Connectivity](https://github.com/shubhampatel19/connectivity-platform),
 |---|---|---|---|---|
 | Overheat | CPU ≥ 90°C | CPU < 85°C | `thermal.critical`, critical | yes |
 | PSU sag | 12V rail ≥ 0.20V off | rail < 0.15V off | `power.rail_out_of_range`, warning | yes |
-| Disk wear | reallocated sector count rises | — | `storage.reallocated_sectors`, warning, value = count | no |
+| Disk reallocation | reallocated sector count rises | — | `storage.reallocated_sectors`, warning, value = count | yes |
 
 Each fault raises one alert when it starts. The gap between the start and clear thresholds (hysteresis) stops a noisy reading from raising a new alert every time it wobbles across the line. A sagging rail sits right at the threshold, so a sag still flaps and raises several alerts; the case service's rules are what tell a flapping rail from one stray reading.
+
+## Root causes
+
+Every fault has a root cause, and the device never reports it. The cloud sees only symptoms: readings, alerts, and the system log in the bundle. Each cause leaves its own raw evidence, but it is evidence, not a verdict, so telling causes of the same fault apart takes knowing what the readings mean. That knowledge lives in the runbooks that [AI triage](https://github.com/shubhampatel19/connectivity-ai-triage) retrieves.
+
+| Fault | Cause | What the device logs |
+|---|---|---|
+| thermal | `fan_failure` | BMC: fan1 tachometer reads 0 RPM, fan redundancy lost. The averaged `fan=` in the agent's own lines and the alert still looks healthy |
+| thermal | `blocked_airflow` | Both fans at 100% duty with a normal inlet, yet exhaust runs 30°C above inlet instead of about 11°C |
+| thermal | `high_ambient` (site-wide) | BMC: inlet temperature above the 35°C operating limit; the inlet-to-exhaust rise stays normal |
+| psu | `psu_failing` | BMC: PSU1 predictive failure; PSU1 output ripple over its limit; AC input normal |
+| psu | `input_power` (site-wide) | AC input below the 200V low-line threshold on both PSU1 and PSU2 |
+| psu | `loose_power_cable` | PSU1 AC input lost, then restored, over and over; PSU2 fine |
+| disk | `disk_wear` | SMART: a sector or two reallocated, none pending, high percentage used; no I/O errors |
+| disk | `disk_failing` | Kernel I/O errors, sectors pending, RAID predictive failure, and more errors after |
+
+Faults that start on their own get a random device-level cause. Site-wide causes (`high_ambient`, `input_power`) happen only when injected, normally on every device at once.
 
 How often faults happen on their own: an overheat or a PSU sag about once an hour across 300 devices at the default interval, and about 2% of devices have a degrading disk that keeps reallocating. `FAULT_RATE` scales all of it; `0` leaves only injected faults.
 
@@ -46,12 +63,27 @@ The outbox is in memory, so an agent restart loses alerts it hasn't sent. That i
 For drills and CI, the metrics port also takes fault requests:
 
 ```bash
-curl -X POST 'localhost:9102/debug/faults?kind=thermal'                  # one random device
-curl -X POST 'localhost:9102/debug/faults?kind=thermal&devices=all'      # every device in this process: a site-wide cooling failure
-curl -X POST 'localhost:9102/debug/faults?kind=psu&device=site-a-00007'  # one named device
+curl -X POST 'localhost:9102/debug/faults?kind=thermal'                                    # one random device, random device-level cause
+curl -X POST 'localhost:9102/debug/faults?kind=thermal&cause=high_ambient&devices=all'     # the room is too hot, every device in this process
+curl -X POST 'localhost:9102/debug/faults?kind=psu&cause=loose_power_cable&device=site-a-00007'
+curl 'localhost:9102/debug/faults?device=site-a-00007'                                     # the answer key
 ```
 
-`kind` is `thermal`, `psu` or `disk`. The response lists the devices hit. The fault starts on each device's next reading; an overheat takes about 15 readings to cross 90°C.
+`kind` is `thermal`, `psu` or `disk`; `cause` is optional and must be a cause of that kind. The response lists the devices hit and the cause each got. The fault starts on each device's next reading; an overheat takes about 15 readings to cross 90°C. An injected `disk_wear` lands on at least 5 reallocated sectors, the default case rule's threshold, so a drill's disk fault always becomes a case.
+
+**The answer key.** `GET /debug/faults` returns the true cause behind recent alerts, injected or natural, oldest first (`device=` and `limit=` narrow it). It's in memory, like the outbox. It exists so drills and evals can grade a diagnosis; nothing in the cloud reads it.
+
+**Planting log lines.** `POST /debug/logs` writes a line into devices' system logs, to be picked up by their next bundle. Target devices as above. Send the line as the request body, or `preset=prompt_injection` for a line that tries to talk an AI triage assistant out of its job, arriving the way such text really does: through a customer-editable field (the asset tag) that firmware copies into its log. `level`, `component` and `repeat` shape it; a large `repeat` floods the log ring and pushes older evidence out, like a log storm on a real device.
+
+## Labelled cases for evals
+
+`cmd/bundlegen` runs simulated devices offline through every cause and writes what the cloud would have received, plus the answer:
+
+```bash
+go run ./cmd/bundlegen -out cases -per-cause 3 -prompt-injection 0.25
+```
+
+Each case directory holds `label.json` (the true cause, seed and generator version), `alerts.json`, `telemetry.json` and the alert's `bundle.tar.gz`; `manifest.jsonl` lists them. A run is deterministic: the same flags give the same bytes. The simulator uses the live device's sensors, log and bundle code on a fake clock, so the cases can't drift from what devices really send. AI triage's eval suite is built from them.
 
 ## Log bundles
 

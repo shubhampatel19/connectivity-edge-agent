@@ -168,13 +168,13 @@ func TestAlertCarriesItsBundleID(t *testing.T) {
 
 func TestInjectedFaultsShowUpInReadings(t *testing.T) {
 	s := NewSensors(rand.New(rand.NewPCG(1, 2)), 0) // no natural faults
-	s.Inject(FaultThermal)
-	s.Inject(FaultDisk)
-	s.Inject(FaultPSU)
+	s.Inject(FaultThermal, "")
+	s.Inject(FaultDisk, "")
+	s.Inject(FaultPSU, "")
 	var maxTemp, minRail, disk float64
 	minRail = 99
 	for i := 0; i < 30; i++ {
-		for _, x := range s.Read(time.Now()) {
+		for _, x := range s.Read(time.Now()).Samples {
 			switch x.Metric {
 			case "cpu_temp_c":
 				maxTemp = max(maxTemp, x.Value)
@@ -192,7 +192,7 @@ func TestInjectedFaultsShowUpInReadings(t *testing.T) {
 		t.Fatalf("an injected sag should take the rail %.2fV low, lowest was %.3f", psuAlertV, minRail)
 	}
 	if disk < 5 {
-		t.Fatalf("an injected disk fault adds 5 sectors, count is %v", disk)
+		t.Fatalf("an injected disk fault reaches at least 5 sectors, count is %v", disk)
 	}
 }
 

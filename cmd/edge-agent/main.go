@@ -117,6 +117,8 @@ func run(log *slog.Logger) error {
 		mux := http.NewServeMux()
 		mux.Handle("GET /metrics", platform.MetricsHandler(reg))
 		mux.Handle("POST /debug/faults", fleet.FaultHandler())
+		mux.Handle("GET /debug/faults", fleet.FaultHandler())
+		mux.Handle("POST /debug/logs", fleet.LogHandler())
 		if err := platform.Serve(ctx, log, metricsAddr, mux); err != nil {
 			log.Error("metrics server failed", "err", err)
 			stop()

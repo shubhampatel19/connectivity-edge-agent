@@ -65,6 +65,8 @@ type Device struct {
 	thermalFault    bool
 	psuFault        bool
 	lastReallocated float64
+
+	faults *FaultLog // where started faults' true causes go; nil keeps none
 }
 
 // Token returns the device's current credential. The uploader reads it from
@@ -103,11 +105,11 @@ func (d *Device) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case now := <-ticker.C:
-			samples := d.sensors.Read(now)
-			if dropped := d.buf.Push(samples...); dropped > 0 {
+			r := d.sensors.Read(now)
+			if dropped := d.buf.Push(r.Samples...); dropped > 0 {
 				d.m.samplesDropped.Add(float64(dropped))
 			}
-			d.raiseAlerts(now, d.observe(now, tick, samples))
+			d.raiseAlerts(now, d.observe(now, tick, r))
 			d.sendAlerts(ctx)
 			d.flush(ctx)
 			if tick%d.cfg.HeartbeatEvery == 0 {
@@ -118,11 +120,17 @@ func (d *Device) Run(ctx context.Context) {
 	}
 }
 
-// observe writes what a real device's system log would say about these
-// readings, and returns the faults that started on this reading.
-func (d *Device) observe(now time.Time, tick int, samples []wire.Sample) []alertSignal {
-	v := make(map[string]float64, len(samples))
-	for _, s := range samples {
+// observe writes what a real device's system log would say about this
+// reading, and returns the faults that started on it. The firmware's own
+// lines come first, then the agent's threshold checks, then the background
+// chatter every device's log has, so evidence sits among ordinary lines the
+// way it does on a real box.
+func (d *Device) observe(now time.Time, tick int, r Reading) []alertSignal {
+	for _, e := range r.Events {
+		d.logs.Add(now, e.Level, e.Component, e.Msg)
+	}
+	v := make(map[string]float64, len(r.Samples))
+	for _, s := range r.Samples {
 		v[s.Metric] = s.Value
 	}
 	var started []alertSignal
@@ -138,7 +146,7 @@ func (d *Device) observe(now time.Time, tick int, samples []wire.Sample) []alert
 	case !d.thermalFault && temp >= thermalFaultC:
 		d.thermalFault = true
 		started = append(started, alertSignal{
-			code: wire.AlertThermalCritical, severity: wire.SeverityCritical, value: temp, wantsBundle: true,
+			code: wire.AlertThermalCritical, severity: wire.SeverityCritical, value: temp, wantsBundle: true, state: r.Thermal,
 			message: fmt.Sprintf("cpu_temp=%.1fC over fault threshold %.0fC, fan=%.0frpm", temp, thermalFaultC, fan),
 		})
 	case d.thermalFault && temp < thermalClearC:
@@ -146,13 +154,18 @@ func (d *Device) observe(now time.Time, tick int, samples []wire.Sample) []alert
 		d.logs.Add(now, "INFO", "thermal", fmt.Sprintf("cpu_temp=%.1fC back under %.0fC, thermal fault cleared", temp, thermalClearC))
 	}
 
-	if r := v["disk_reallocated_sectors"]; r > d.lastReallocated {
-		d.logs.Add(now, "WARN", "storage", fmt.Sprintf("disk0 reallocated sector count rose to %.0f", r))
+	if re := v["disk_reallocated_sectors"]; re > d.lastReallocated {
+		d.logs.Add(now, "WARN", "storage", fmt.Sprintf("disk0 reallocated sector count rose to %.0f", re))
 		started = append(started, alertSignal{
-			code: wire.AlertDiskReallocated, severity: wire.SeverityWarning, value: r,
-			message: fmt.Sprintf("disk0 reallocated sector count rose to %.0f", r),
+			code: wire.AlertDiskReallocated, severity: wire.SeverityWarning, value: re, state: r.Disk,
+			// The logs are what tell a worn disk (a sector or two, nothing
+			// pending) from a failing one (I/O errors, pending sectors), so a
+			// disk alert brings them like the others; the cooldown still limits
+			// how often.
+			wantsBundle: true,
+			message:     fmt.Sprintf("disk0 reallocated sector count rose to %.0f", re),
 		})
-		d.lastReallocated = r
+		d.lastReallocated = re
 	}
 
 	psu := v["psu_voltage_v"]
@@ -164,7 +177,7 @@ func (d *Device) observe(now time.Time, tick int, samples []wire.Sample) []alert
 	case !d.psuFault && dev >= psuAlertV:
 		d.psuFault = true
 		started = append(started, alertSignal{
-			code: wire.AlertPSURail, severity: wire.SeverityWarning, value: psu, wantsBundle: true,
+			code: wire.AlertPSURail, severity: wire.SeverityWarning, value: psu, wantsBundle: true, state: r.PSU,
 			message: fmt.Sprintf("PSU1 12V rail at %.3fV, outside +/-%.2fV", psu, psuAlertV),
 		})
 	case d.psuFault && dev < psuClearV:
@@ -172,9 +185,32 @@ func (d *Device) observe(now time.Time, tick int, samples []wire.Sample) []alert
 	}
 
 	if tick%12 == 0 {
-		d.logs.Add(now, "INFO", "telemetry", fmt.Sprintf("sampled %d metrics, %d samples buffered", len(samples), d.buf.Len()))
+		d.logs.Add(now, "INFO", "telemetry", fmt.Sprintf("sampled %d metrics, %d samples buffered", len(r.Samples), d.buf.Len()))
 	}
+	d.chatter(now)
 	return started
+}
+
+// chatter writes the routine lines every device's log carries: time sync,
+// RAID housekeeping, and the odd warning that has nothing to do with today's
+// fault. A cause has to be found among these.
+func (d *Device) chatter(now time.Time) {
+	if d.rng == nil {
+		return
+	}
+	p := d.rng.Float64()
+	switch {
+	case p < 1.0/240:
+		d.logs.Add(now, "INFO", "ntp", fmt.Sprintf("clock synchronized to 10.%d.0.1, offset %+.1fms", 1+d.rng.IntN(3), d.rng.NormFloat64()*3))
+	case p < 1.0/240+1.0/900:
+		d.logs.Add(now, "INFO", "raid", "patrol read completed on VD0, 0 errors")
+	case p < 1.0/240+1.0/900+1.0/1500:
+		d.logs.Add(now, "WARN", "bmc", fmt.Sprintf("system event log %d%% full, oldest entries will be overwritten", 80+d.rng.IntN(15)))
+	case p < 1.0/240+1.0/900+1.0/1500+1.0/2000:
+		d.logs.Add(now, "WARN", "security", fmt.Sprintf("device certificate expires in %d days", 10+d.rng.IntN(20)))
+	case p < 1.0/240+1.0/900+1.0/1500+1.0/2000+1.0/1200:
+		d.logs.Add(now, "WARN", "kernel", "eth1: link down (port not cabled)")
+	}
 }
 
 // maybeCollect collects a scheduled bundle when one is due.
@@ -186,22 +222,30 @@ func (d *Device) maybeCollect(now time.Time) {
 	d.collect(now, wire.ReasonScheduled)
 }
 
-// collect builds a bundle from the current logs and hands it to the uploader.
-// It returns the bundle ID, or "" if the bundle couldn't be built or spooled.
-func (d *Device) collect(now time.Time, reason wire.BundleReason) string {
+// packBundle builds a bundle from the current logs, ready to upload.
+func (d *Device) packBundle(now time.Time, reason wire.BundleReason, id string) (wire.BundleInitRequest, []byte, error) {
 	data, err := buildBundle(bundleInput{
 		DeviceID: d.id, Model: d.model, Firmware: d.firmware, Site: d.site,
 		Reason: reason, CollectedAt: now, Logs: d.logs.Snapshot(),
 		TraceBytes: d.bundleCfg.TraceBytes, Rng: d.rng,
 	})
 	if err != nil {
-		d.log.Error("building log bundle failed", "reason", reason, "err", err)
-		return ""
+		return wire.BundleInitRequest{}, nil, err
 	}
 	sum := sha256.Sum256(data)
-	req := wire.BundleInitRequest{
-		BundleID: newBatchID(), DeviceID: d.id, SizeBytes: int64(len(data)),
+	return wire.BundleInitRequest{
+		BundleID: id, DeviceID: d.id, SizeBytes: int64(len(data)),
 		SHA256: hex.EncodeToString(sum[:]), Reason: reason, CollectedAt: now.UTC(),
+	}, data, nil
+}
+
+// collect builds a bundle from the current logs and hands it to the uploader.
+// It returns the bundle ID, or "" if the bundle couldn't be built or spooled.
+func (d *Device) collect(now time.Time, reason wire.BundleReason) string {
+	req, data, err := d.packBundle(now, reason, newBatchID())
+	if err != nil {
+		d.log.Error("building log bundle failed", "reason", reason, "err", err)
+		return ""
 	}
 	if err := d.uploader.Submit(req, data); err != nil {
 		d.log.Error("spooling log bundle failed", "bundle_id", req.BundleID, "err", err)

@@ -362,11 +362,11 @@ func TestBuildBundleContents(t *testing.T) {
 func TestObserveRaisesEachFaultOnceWithHysteresis(t *testing.T) {
 	d := &Device{logs: NewLogRing(100), buf: NewBuffer(10)}
 	now := time.Now()
-	read := func(temp, psu, disk float64) []wire.Sample {
-		return []wire.Sample{
+	read := func(temp, psu, disk float64) Reading {
+		return Reading{Samples: []wire.Sample{
 			{Metric: "cpu_temp_c", Value: temp}, {Metric: "psu_voltage_v", Value: psu},
 			{Metric: "disk_reallocated_sectors", Value: disk},
-		}
+		}}
 	}
 	codes := func(sigs []alertSignal) string {
 		var out []string
