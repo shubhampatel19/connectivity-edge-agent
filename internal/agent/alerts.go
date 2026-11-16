@@ -185,7 +185,7 @@ func (d *Device) sendAlerts(ctx context.Context) {
 			d.alerts.pop()
 			d.m.alertsRejected.Inc()
 			d.log.ErrorContext(actx, "backend rejected alert permanently, dropping it", "alert_id", a.AlertID, "code", a.Code, "err", err)
-			d.logs.Add(time.Now(), "ERROR", "support", fmt.Sprintf("alert %s rejected by cloud: %v", a.AlertID, err))
+			d.logs.Add(d.clock(), "ERROR", "support", fmt.Sprintf("alert %s rejected by cloud: %v", a.AlertID, err))
 			continue
 		default:
 			reason := errorReason(err)

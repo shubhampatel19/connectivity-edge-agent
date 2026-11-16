@@ -33,6 +33,9 @@ func run(log *slog.Logger) error {
 	prefix := env.String("DEVICE_PREFIX", siteID)
 	count := env.Int("DEVICE_COUNT", 50)
 	firmware := env.String("FIRMWARE_VERSION", "1.4.2")
+	firmwareMix, firmwareMixErr := agent.ParseFirmwareMix(env.String("FIRMWARE_MIX", ""))
+	clockSkew := env.Duration("CLOCK_SKEW_MAX", 0)
+	bulkTimeout := env.Duration("BUNDLE_HTTP_TIMEOUT", agent.DefaultBulkTimeout)
 	interval := env.Duration("SEND_INTERVAL", 5*time.Second)
 	heartbeatEvery := env.Int("HEARTBEAT_EVERY", 6)
 	bufferCap := env.Int("BUFFER_CAPACITY", 2000)
@@ -60,6 +63,8 @@ func run(log *slog.Logger) error {
 	env.Check(alertQueue > 0, "ALERT_QUEUE_CAPACITY must be positive")
 	env.Check(faultRateErr == nil && faultRate >= 0, "FAULT_RATE must be a number, 0 or more")
 	env.Check(bundleInterval >= 0, "BUNDLE_INTERVAL must not be negative")
+	env.Check(firmwareMixErr == nil, fmt.Sprintf("FIRMWARE_MIX: %v", firmwareMixErr))
+	env.Check(clockSkew >= 0, "CLOCK_SKEW_MAX must not be negative")
 	env.Check(traceBytes >= 0, "BUNDLE_TRACE_BYTES must not be negative")
 	env.Check(spoolMax > 0, "SPOOL_MAX_BUNDLES must be positive")
 	env.Check(uploadConcurrency > 0, "UPLOAD_CONCURRENCY must be positive")
@@ -71,11 +76,14 @@ func run(log *slog.Logger) error {
 
 	reg := platform.NewRegistry()
 	client := agent.NewClient(ingestURL, enrollmentKey, httpTimeout)
+	client.SetBulkTimeout(bulkTimeout)
 	fleet, err := agent.NewFleet(agent.FleetConfig{
 		SiteID:         siteID,
 		DevicePrefix:   prefix,
 		Count:          count,
 		Firmware:       firmware,
+		FirmwareMix:    firmwareMix,
+		ClockSkewMax:   clockSkew,
 		BufferCapacity: bufferCap,
 		LogLines:       logLines,
 		Device: agent.DeviceConfig{

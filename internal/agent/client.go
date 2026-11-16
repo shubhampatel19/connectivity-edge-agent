@@ -39,7 +39,15 @@ type Client struct {
 	base          string
 	enrollmentKey string
 	hc            *http.Client
+	// bulk sends bundle chunks and completions. They move far more bytes
+	// than a telemetry batch, and on a thin site link a chunk that must fit
+	// in the ordinary timeout never arrives at all.
+	bulk *http.Client
 }
+
+// DefaultBulkTimeout is how long one bundle chunk, or the cloud's assembly
+// of a finished bundle, may take.
+const DefaultBulkTimeout = 2 * time.Minute
 
 func NewClient(baseURL, enrollmentKey string, timeout time.Duration) *Client {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
@@ -49,7 +57,14 @@ func NewClient(baseURL, enrollmentKey string, timeout time.Duration) *Client {
 		base:          strings.TrimRight(baseURL, "/"),
 		enrollmentKey: enrollmentKey,
 		hc:            &http.Client{Timeout: timeout, Transport: tr},
+		bulk:          &http.Client{Timeout: max(timeout, DefaultBulkTimeout), Transport: tr},
 	}
+}
+
+// SetBulkTimeout changes the timeout for bundle chunks and completions. It
+// is never shorter than the ordinary request timeout.
+func (c *Client) SetBulkTimeout(d time.Duration) {
+	c.bulk.Timeout = max(d, c.hc.Timeout)
 }
 
 func (c *Client) Register(ctx context.Context, req wire.RegisterRequest) (string, error) {
@@ -81,12 +96,13 @@ func (c *Client) UploadChunk(ctx context.Context, deviceID, token, bundleID stri
 	h := deviceHeaders(deviceID, token)
 	h[wire.HeaderChunkSHA256] = hex.EncodeToString(sum[:])
 	path := fmt.Sprintf("/v1/bundles/%s/chunks/%d", bundleID, index)
-	return c.do(ctx, http.MethodPut, "/v1/bundles/{bundle_id}/chunks/{index}", path, h, "application/octet-stream", bytes.NewReader(data), nil)
+	return c.doWith(c.bulk, ctx, http.MethodPut, "/v1/bundles/{bundle_id}/chunks/{index}", path, h, "application/octet-stream", bytes.NewReader(data), nil)
 }
 
 func (c *Client) CompleteBundle(ctx context.Context, deviceID, token, bundleID string) (wire.BundleStatus, error) {
 	var st wire.BundleStatus
-	err := c.postJSON(ctx, "/v1/bundles/{bundle_id}/complete", "/v1/bundles/"+bundleID+"/complete", deviceHeaders(deviceID, token), struct{}{}, &st)
+	err := c.doWith(c.bulk, ctx, http.MethodPost, "/v1/bundles/{bundle_id}/complete", "/v1/bundles/"+bundleID+"/complete",
+		deviceHeaders(deviceID, token), "application/json", strings.NewReader("{}"), &st)
 	return st, err
 }
 
@@ -104,7 +120,11 @@ func (c *Client) postJSON(ctx context.Context, route, path string, headers map[s
 
 // do sends one request inside a client span named after its route, carrying
 // the trace context in a traceparent header so the cloud continues the trace.
-func (c *Client) do(ctx context.Context, method, route, path string, headers map[string]string, contentType string, body io.Reader, out any) (err error) {
+func (c *Client) do(ctx context.Context, method, route, path string, headers map[string]string, contentType string, body io.Reader, out any) error {
+	return c.doWith(c.hc, ctx, method, route, path, headers, contentType, body, out)
+}
+
+func (c *Client) doWith(hc *http.Client, ctx context.Context, method, route, path string, headers map[string]string, contentType string, body io.Reader, out any) (err error) { //nolint:revive // ctx follows the client it is sent with
 	ctx, span := platform.Tracer().Start(ctx, method+" "+route,
 		trace.WithSpanKind(trace.SpanKindClient),
 		trace.WithAttributes(attribute.String("http.request.method", method), attribute.String("url.path", path)))
@@ -123,7 +143,7 @@ func (c *Client) do(ctx context.Context, method, route, path string, headers map
 	}
 	platform.InjectHTTP(ctx, req.Header)
 
-	resp, err := c.hc.Do(req)
+	resp, err := hc.Do(req)
 	if err != nil {
 		return err
 	}

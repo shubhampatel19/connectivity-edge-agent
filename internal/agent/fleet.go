@@ -21,10 +21,17 @@ import (
 )
 
 type FleetConfig struct {
-	SiteID         string
-	DevicePrefix   string
-	Count          int
-	Firmware       string
+	SiteID       string
+	DevicePrefix string
+	Count        int
+	Firmware     string
+	// FirmwareMix, when set, replaces Firmware: devices are spread over
+	// several versions in the given proportions, the way a real fleet looks
+	// partway through a staged rollout.
+	FirmwareMix []FirmwareShare
+	// ClockSkewMax gives each device a fixed clock error, uniform between
+	// minus and plus this much. Zero means every clock is right.
+	ClockSkewMax   time.Duration
 	BufferCapacity int
 	LogLines       int
 	Device         DeviceConfig
@@ -37,6 +44,51 @@ type FleetConfig struct {
 	SpoolDir string
 	SpoolMax int
 	Uploads  UploaderConfig
+}
+
+// FirmwareShare is one firmware version and its weight in the fleet.
+type FirmwareShare struct {
+	Version string
+	Weight  int
+}
+
+// ParseFirmwareMix reads "1.4.2=70,1.5.0=30". Weights are relative.
+func ParseFirmwareMix(s string) ([]FirmwareShare, error) {
+	if strings.TrimSpace(s) == "" {
+		return nil, nil
+	}
+	var out []FirmwareShare
+	for _, part := range strings.Split(s, ",") {
+		version, weight, ok := strings.Cut(strings.TrimSpace(part), "=")
+		n, err := strconv.Atoi(weight)
+		if !ok || version == "" || err != nil || n <= 0 {
+			return nil, fmt.Errorf("firmware mix entry %q must look like version=weight, with a positive weight", part)
+		}
+		out = append(out, FirmwareShare{Version: version, Weight: n})
+	}
+	return out, nil
+}
+
+// firmwareFor spreads devices over the mix deterministically, so device N
+// runs the same firmware after every restart.
+func firmwareFor(i int, mix []FirmwareShare, fallback string) string {
+	total := 0
+	for _, m := range mix {
+		total += m.Weight
+	}
+	if total == 0 {
+		return fallback
+	}
+	// A fixed stride coprime with most totals interleaves versions across
+	// device numbers instead of grouping them.
+	slot := (i * 37) % total
+	for _, m := range mix {
+		if slot < m.Weight {
+			return m.Version
+		}
+		slot -= m.Weight
+	}
+	return fallback
 }
 
 var models = []string{"edge-server-e1", "storage-node-s2", "network-switch-n3"}
@@ -85,7 +137,7 @@ func NewFleet(cfg FleetConfig, client *Client, log *slog.Logger, reg prometheus.
 	for i := range f.devices {
 		id := fmt.Sprintf("%s-%05d", cfg.DevicePrefix, i+1)
 		d := &Device{
-			id: id, model: models[i%len(models)], firmware: cfg.Firmware, site: cfg.SiteID,
+			id: id, model: models[i%len(models)], firmware: firmwareFor(i, cfg.FirmwareMix, cfg.Firmware), site: cfg.SiteID,
 			cfg: cfg.Device, bundleCfg: cfg.Bundles, client: client, uploader: f.uploader,
 			sensors: NewSensors(newRand(), cfg.FaultRate),
 			buf:     NewBuffer(cfg.BufferCapacity),
@@ -95,6 +147,9 @@ func NewFleet(cfg FleetConfig, client *Client, log *slog.Logger, reg prometheus.
 			log:     log.With("device_id", id),
 			rng:     newRand(),
 			faults:  f.faults,
+		}
+		if cfg.ClockSkewMax > 0 {
+			d.skew = time.Duration(d.rng.Int64N(2*int64(cfg.ClockSkewMax)+1)) - cfg.ClockSkewMax
 		}
 		f.devices[i] = d
 		byID[id] = d

@@ -41,6 +41,9 @@ type BundleConfig struct {
 // Device is one simulated field device running in its own goroutine.
 type Device struct {
 	id, model, firmware, site string
+	// skew is how far this device's clock is from true time. Fixed for the
+	// device's life; see clock.
+	skew time.Duration
 
 	cfg       DeviceConfig
 	bundleCfg BundleConfig
@@ -83,6 +86,12 @@ func (d *Device) setToken(t string) {
 	d.tokenMu.Unlock()
 }
 
+// clock is the device's own idea of the time: the host's clock plus this
+// device's fixed skew. Real devices drift, lose their NTP server, or boot
+// with a dead RTC battery; the cloud has to cope with timestamps that are a
+// little wrong and reject ones that are very wrong.
+func (d *Device) clock() time.Time { return time.Now().Add(d.skew) }
+
 // Run registers the device, then reads sensors and ships telemetry every tick
 // until ctx is cancelled.
 func (d *Device) Run(ctx context.Context) {
@@ -95,7 +104,7 @@ func (d *Device) Run(ctx context.Context) {
 		return
 	}
 	if d.bundleCfg.Interval > 0 {
-		d.nextBundle = time.Now().Add(time.Duration(d.rng.Int64N(int64(d.bundleCfg.Interval))))
+		d.nextBundle = d.clock().Add(time.Duration(d.rng.Int64N(int64(d.bundleCfg.Interval))))
 	}
 
 	ticker := time.NewTicker(d.cfg.SendInterval)
@@ -105,6 +114,7 @@ func (d *Device) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case now := <-ticker.C:
+			now = now.Add(d.skew) // everything the device stamps uses its own clock
 			r := d.sensors.Read(now)
 			if dropped := d.buf.Push(r.Samples...); dropped > 0 {
 				d.m.samplesDropped.Add(float64(dropped))
@@ -299,7 +309,7 @@ func (d *Device) flush(ctx context.Context) {
 			d.m.batchesRejected.Inc()
 			d.log.ErrorContext(sctx, "backend rejected batch permanently, dropping it",
 				"batch_id", d.pending.BatchID, "samples", len(d.pending.Samples), "err", err)
-			d.logs.Add(time.Now(), "ERROR", "connectivity", fmt.Sprintf("telemetry batch rejected by cloud: %v", err))
+			d.logs.Add(d.clock(), "ERROR", "connectivity", fmt.Sprintf("telemetry batch rejected by cloud: %v", err))
 			d.clearPending()
 			continue
 		default:
@@ -307,7 +317,7 @@ func (d *Device) flush(ctx context.Context) {
 			d.m.sendFailures.WithLabelValues(reason).Inc()
 			d.log.WarnContext(sctx, "send failed, will retry next tick",
 				"batch_id", d.pending.BatchID, "reason", reason, "err", err)
-			d.logs.Add(time.Now(), "WARN", "connectivity", fmt.Sprintf("telemetry upload failed (%s), %d samples buffered", reason, d.buf.Len()))
+			d.logs.Add(d.clock(), "WARN", "connectivity", fmt.Sprintf("telemetry upload failed (%s), %d samples buffered", reason, d.buf.Len()))
 		}
 		return
 	}
@@ -341,7 +351,7 @@ func (d *Device) register(ctx context.Context) bool {
 			d.setToken(token)
 			d.m.registrations.Inc()
 			d.log.Info("registered", "attempt", attempt)
-			d.logs.Add(time.Now(), "INFO", "connectivity", "registered with cloud")
+			d.logs.Add(d.clock(), "INFO", "connectivity", "registered with cloud")
 			return true
 		}
 		if ctx.Err() != nil {

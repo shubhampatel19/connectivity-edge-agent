@@ -4,6 +4,8 @@ Simulates a fleet of field devices streaming hardware telemetry to the cloud. Ea
 
 Part of [Connectivity](https://github.com/shubhampatel19/connectivity-platform), a mock edge-to-cloud telemetry system built for practicing production debugging.
 
+See [docs/DESIGN.md](docs/DESIGN.md) for how the code is put together and why.
+
 ## What each device does
 
 1. Starts at a random offset inside the send interval, so the fleet doesn't tick in lockstep.
@@ -132,6 +134,10 @@ Set `OTEL_TRACES_SAMPLER=parentbased_traceidratio` and `OTEL_TRACES_SAMPLER_ARG=
 | `BUFFER_CAPACITY` | `2000` samples per device |
 | `MAX_BATCH` / `MAX_DRAIN_BATCHES` | `200` / `5` |
 | `HTTP_TIMEOUT` | `10s` |
+| `BUNDLE_HTTP_TIMEOUT` | `2m`: one bundle chunk, or the cloud assembling a finished bundle |
+| `FIRMWARE_VERSION` | `1.4.2` |
+| `FIRMWARE_MIX` | unset; `1.4.2=70,1.5.0=30` spreads the fleet over versions, as partway through a rollout |
+| `CLOCK_SKEW_MAX` | `0`; `90s` gives each device a fixed clock error of up to ±90s |
 | `METRICS_ADDR` | `:9102` |
 | `LOG_LINES` | `1000` lines of system log per device |
 | `ALERT_QUEUE_CAPACITY` | `100` alerts per device |

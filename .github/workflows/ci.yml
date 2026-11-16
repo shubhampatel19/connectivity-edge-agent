@@ -1,8 +1,9 @@
 name: ci
 
+# Every push runs CI, on any branch, so a branch is verified before a pull
+# request exists. Pull requests from forks run it too.
 on:
   push:
-    branches: [main]
   pull_request:
 
 jobs:
